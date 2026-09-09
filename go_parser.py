@@ -1,0 +1,1150 @@
+"""Small Go parser for the Python Go-runtime translation layer.
+
+This parser intentionally stops at a language AST.  It does not compile Go and
+it does not pretend to implement the Go compiler's type checker.  The AST keeps
+constructs that the companion runtime modules can lower later: interfaces,
+switch/case, goto/labels, goroutines, defer, channels and ordinary declarations.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, Sequence, Tuple
+import re
+
+
+# ----------------------------- lexer ---------------------------------------
+
+KEYWORDS = {
+    "break", "default", "func", "interface", "select", "case", "defer",
+    "go", "map", "struct", "chan", "else", "goto", "package", "switch",
+    "const", "fallthrough", "if", "range", "type", "continue", "for",
+    "import", "return", "var",
+}
+
+MULTI_OPS = sorted([
+    "...", ">>=", "<<=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+    "&^=", "==", "!=", "<=", ">=", "&&", "||", "++", "--", ":=", "<-",
+    "<<", ">>", "&^", "=>",
+], key=len, reverse=True)
+
+SINGLE = set("+-*/%&|^<>=!~()[]{}.,;:~")
+
+
+@dataclass(frozen=True)
+class Token:
+    kind: str
+    value: str
+    line: int
+    column: int
+
+    def __repr__(self):
+        return f"Token({self.kind!r}, {self.value!r}, {self.line}:{self.column})"
+
+
+class GoSyntaxError(SyntaxError):
+    pass
+
+
+class Lexer:
+    def __init__(self, source: str):
+        self.source = source
+        self.i = 0
+        self.line = 1
+        self.col = 1
+        self.tokens: List[Token] = []
+        self._line_start = True
+
+    def _advance(self, text: str) -> None:
+        n = text.count("\n")
+        if n:
+            self.line += n
+            self.col = len(text.rsplit("\n", 1)[-1]) + 1
+            self._line_start = True
+        else:
+            self.col += len(text)
+            self._line_start = False
+        self.i += len(text)
+
+    def _emit(self, kind: str, value: str, line: int, col: int) -> None:
+        self.tokens.append(Token(kind, value, line, col))
+
+    def tokenize(self) -> List[Token]:
+        s = self.source
+        while self.i < len(s):
+            c = s[self.i]
+            if c in " \t\r":
+                j = self.i + 1
+                while j < len(s) and s[j] in " \t\r": j += 1
+                self._advance(s[self.i:j]); continue
+            if c == "\n":
+                if self.tokens and self.tokens[-1].value in (
+                    ")", "]", "}", "++", "--",
+                    "break", "continue", "fallthrough", "return"
+                ) or (self.tokens and self.tokens[-1].kind in ("ident", "number", "string", "rune")):
+                    last=self.tokens[-1]
+                    self.tokens.append(Token("op", ";", last.line, last.column + max(1, len(last.value))))
+                self._advance("\n"); continue
+            if s.startswith("//", self.i):
+                j = s.find("\n", self.i)
+                if j < 0: j = len(s)
+                self._advance(s[self.i:j]); continue
+            if s.startswith("/*", self.i):
+                j = s.find("*/", self.i + 2)
+                if j < 0: raise GoSyntaxError(f"unterminated block comment at {self.line}:{self.col}")
+                j += 2
+                self._advance(s[self.i:j]); continue
+            line, col = self.line, self.col
+            if c.isalpha() or c == "_":
+                j = self.i + 1
+                while j < len(s) and (s[j].isalnum() or s[j] == "_"): j += 1
+                v = s[self.i:j]
+                self._advance(v)
+                self._emit("keyword" if v in KEYWORDS else "ident", v, line, col)
+                continue
+            if c == "." and self.i + 1 < len(s) and s[self.i + 1].isdigit():
+                m = re.match(r"\.[0-9](?:_?[0-9])*(?:[eE][+-]?[0-9](?:_?[0-9])*)?", s[self.i:])
+                if not m: raise GoSyntaxError(f"bad number at {line}:{col}")
+                v = m.group(0); self._advance(v); self._emit("number", v, line, col); continue
+            if c.isdigit():
+                m = re.match(r"(?:0[xX](?:[0-9a-fA-F](?:_?[0-9a-fA-F])*)?(?:\.[0-9a-fA-F](?:_?[0-9a-fA-F])*)?[pP][+-]?[0-9](?:_?[0-9])*|0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|0[bB][01](?:_?[01])*|0[oO][0-7](?:_?[0-7])*|(?:[0-9](?:_?[0-9])*)(?:\.[0-9](?:_?[0-9])*)?(?:[eE][+-]?[0-9](?:_?[0-9])*)?[i]?)", s[self.i:])
+                if not m: raise GoSyntaxError(f"bad number at {line}:{col}")
+                v = m.group(0); self._advance(v); self._emit("number", v, line, col); continue
+            if c in "\"'`":
+                q = c; j = self.i + 1
+                while j < len(s):
+                    if q != '`' and s[j] == '\\': j += 2; continue
+                    if s[j] == q: j += 1; break
+                    j += 1
+                else: raise GoSyntaxError(f"unterminated literal at {line}:{col}")
+                v = s[self.i:j]; self._advance(v); self._emit("string" if q != "'" else "rune", v, line, col); continue
+            op = next((x for x in MULTI_OPS if s.startswith(x, self.i)), None)
+            if op:
+                self._advance(op); self._emit("op", op, line, col); continue
+            if c in SINGLE:
+                self._advance(c); self._emit("op", c, line, col); continue
+            raise GoSyntaxError(f"unexpected character {c!r} at {line}:{col}")
+        self.tokens.append(Token("eof", "", self.line, self.col))
+        return self.tokens
+
+
+# ------------------------------- AST ---------------------------------------
+
+@dataclass
+class Node:
+    line: int
+
+@dataclass
+class File(Node):
+    package: str
+    imports: List[Any] = field(default_factory=list)
+    declarations: List[Any] = field(default_factory=list)
+
+@dataclass
+class Import(Node):
+    path: str
+    name: Optional[str] = None
+
+@dataclass
+class TypeSpec(Node):
+    name: str
+    type_expr: Any
+
+@dataclass
+class VarSpec(Node):
+    names: List[str]
+    type_expr: Any = None
+    values: List[Any] = field(default_factory=list)
+
+@dataclass
+class ConstSpec(Node):
+    names: List[str]
+    type_expr: Any = None
+    values: List[Any] = field(default_factory=list)
+
+@dataclass
+class FuncDecl(Node):
+    name: str
+    receiver: Any = None
+    params: List[Any] = field(default_factory=list)
+    results: List[Any] = field(default_factory=list)
+    body: Any = None
+
+@dataclass
+class InterfaceType(Node):
+    methods: List[Any] = field(default_factory=list)
+    embeds: List[Any] = field(default_factory=list)
+
+@dataclass
+class StructType(Node):
+    fields: List[Any] = field(default_factory=list)
+
+@dataclass
+class Field(Node):
+    names: List[str]
+    type_expr: Any
+    tag: Optional[str] = None
+
+@dataclass
+class Block(Node):
+    statements: List[Any] = field(default_factory=list)
+
+@dataclass
+class Expr(Node):
+    kind: str
+    value: Any
+    children: List[Any] = field(default_factory=list)
+
+@dataclass
+class SimpleStmt(Node):
+    op: str
+    left: List[Any] = field(default_factory=list)
+    right: List[Any] = field(default_factory=list)
+
+@dataclass
+class IfStmt(Node):
+    init: Any
+    cond: Any
+    then: Block
+    else_branch: Any = None
+
+@dataclass
+class ForStmt(Node):
+    init: Any = None
+    cond: Any = None
+    post: Any = None
+    body: Block = None
+    range_expr: Any = None
+    range_names: List[Any] = field(default_factory=list)
+
+@dataclass
+class SwitchStmt(Node):
+    init: Any
+    tag: Any
+    clauses: List[Any] = field(default_factory=list)
+
+@dataclass
+class CaseClause(Node):
+    expressions: List[Any]
+    statements: List[Any] = field(default_factory=list)
+    default: bool = False
+
+@dataclass
+class SelectStmt(Node):
+    clauses: List[Any] = field(default_factory=list)
+
+@dataclass
+class CommClause(Node):
+    comm: Any
+    statements: List[Any] = field(default_factory=list)
+    default: bool = False
+
+@dataclass
+class BranchStmt(Node):
+    keyword: str
+    label: Optional[str] = None
+
+@dataclass
+class LabelStmt(Node):
+    label: str
+    statement: Any
+
+@dataclass
+class DeferStmt(Node):
+    call: Any
+
+@dataclass
+class GoStmt(Node):
+    call: Any
+
+@dataclass
+class ReturnStmt(Node):
+    values: List[Any] = field(default_factory=list)
+
+
+# ------------------------------- parser ------------------------------------
+
+class Parser:
+    def __init__(self, source_or_tokens: Sequence[Token] | str):
+        self.tokens = Lexer(source_or_tokens).tokenize() if isinstance(source_or_tokens, str) else list(source_or_tokens)
+        self.i = 0
+
+    @property
+    def t(self) -> Token: return self.tokens[self.i]
+    def peek(self, value=None, kind=None):
+        t = self.t
+        return (value is None or t.value == value) and (kind is None or t.kind == kind)
+    def take(self, value=None):
+        t = self.t
+        if value is not None and t.value != value:
+            raise self.error(f"expected {value!r}, got {t.value!r}")
+        self.i += 1
+        return t
+    def maybe(self, value):
+        if self.peek(value): self.i += 1; return True
+        return False
+    def error(self, msg): return GoSyntaxError(f"{msg} at {self.t.line}:{self.t.column}")
+    def semi(self): self.maybe(";")
+
+    def parse(self) -> File:
+        p = self.take("package")
+        pkg = self.take().value
+        self.semi()
+        imports = []
+        while self.peek("import"): imports.extend(self.parse_import_decl())
+        decls = []
+        while not self.peek(kind="eof"):
+            self.semi()
+            if self.peek(kind="eof"):
+                break
+            decls.append(self.parse_decl())
+        return File(p.line, pkg, imports, decls)
+
+    def parse_import_decl(self):
+        self.take("import"); out=[]
+        if self.maybe("("):
+            while not self.peek(")"):
+                line=self.t.line; name=None
+                if self.t.kind in ("ident", "keyword") and not self.peek(kind="string"):
+                    name=self.take().value
+                path=self.take().value
+                if self.tokens[self.i-1].kind != "string": raise self.error("expected import path")
+                out.append(Import(line, path[1:-1], name)); self.semi()
+            self.take(")"); self.semi(); return out
+        line=self.t.line; name=None
+        if self.t.kind in ("ident","keyword") and self.tokens[self.i+1].kind == "string": name=self.take().value
+        path=self.take().value
+        if self.tokens[self.i-1].kind != "string": raise self.error("expected import path")
+        self.semi(); return [Import(line,path[1:-1],name)]
+
+    def parse_decl(self):
+        if self.peek("func"): return self.parse_func()
+        if self.peek("type"): return self.parse_type_decl()
+        if self.peek("var"): return self.parse_var_decl()
+        if self.peek("const"): return self.parse_const_decl()
+        raise self.error("expected declaration")
+
+    def parse_type_decl(self):
+        line=self.take("type").line
+        if self.maybe("("):
+            specs=[]
+            while not self.peek(")"):
+                n=self.take().value; ty=self.parse_type(); specs.append(TypeSpec(line,n,ty)); self.semi()
+            self.take(")"); self.semi(); return specs
+        n=self.take().value
+        # Go generic type declarations have a type-parameter list between
+        # the name and the underlying type, e.g. `type Pointer[T any] struct`.
+        # The lowering IR erases static type parameters, but the parser must
+        # consume the list so the following `struct`/type is parsed normally.
+        if self.peek("["):
+            depth=0; j=self.i
+            while j < len(self.tokens):
+                v=self.tokens[j].value
+                if v == "[": depth += 1
+                elif v == "]":
+                    depth -= 1
+                    if depth == 0: break
+                j += 1
+            if j < len(self.tokens):
+                inside=self.tokens[self.i+1:j]
+                # `[N]T` is an ordinary array type; generic parameters contain
+                # a parameter name plus a constraint/type expression.
+                if len(inside) >= 2 and inside[0].kind in ("ident", "keyword"):
+                    self.i = j + 1
+        # Do not consume a following `[` here.  In declarations such as
+        # `type Bitmap [8]uint8`, the bracket starts the underlying type.
+        # Generic type parameters are handled separately by the parser;
+        # consuming every bracket here incorrectly turned array definitions
+        # into their element type.
+        # Go type aliases use `type Name = ExistingType`.  The IR represents
+        # aliases and defined types with the same TypeSpec node; consume the
+        # alias marker so the underlying type can still be parsed normally.
+        self.maybe("=")
+        ty=self.parse_type(); self.semi(); return TypeSpec(line,n,ty)
+
+    def parse_var_decl(self):
+        line=self.take("var").line
+        if self.maybe("("):
+            specs=[]
+            while not self.peek(")"):
+                specs.append(self.parse_var_spec(line)); self.semi()
+            self.take(")"); self.semi(); return specs
+        x=self.parse_var_spec(line); self.semi(); return x
+
+    def parse_const_decl(self):
+        line=self.take("const").line
+        if self.maybe("("):
+            specs=[]
+            while not self.peek(")"):
+                specs.append(self.parse_const_spec(line)); self.semi()
+            self.take(")"); self.semi(); return specs
+        x=self.parse_const_spec(line); self.semi(); return x
+
+    def parse_var_spec(self, line):
+        names=self.parse_ident_list()
+        ty=None
+        if not self.peek("="): ty=self.parse_type()
+        vals=[]
+        if self.maybe("="): vals=self.parse_expr_list()
+        return VarSpec(line,names,ty,vals)
+
+    def parse_const_spec(self, line):
+        names=self.parse_ident_list(); ty=None
+        if self.peek(";") or self.peek(")"):
+            return ConstSpec(line,names,None,[])
+        if not self.peek("="): ty=self.parse_type()
+        vals=[]
+        if self.maybe("="): vals=self.parse_expr_list()
+        return ConstSpec(line,names,ty,vals)
+
+    def parse_ident_list(self):
+        out=[self.take().value]
+        while self.maybe(","): out.append(self.take().value)
+        return out
+
+    def parse_func(self):
+        line=self.take("func").line; receiver=None
+        if self.peek("("):
+            # Distinguish method receiver from function parameter list by finding
+            # the matching close followed by the function name.
+            save=self.i; depth=0; j=self.i
+            while j < len(self.tokens):
+                if self.tokens[j].value=="(": depth+=1
+                elif self.tokens[j].value==")":
+                    depth-=1
+                    if depth==0: break
+                j+=1
+            if j+1 < len(self.tokens) and self.tokens[j+1].kind in ("ident","keyword"):
+                receiver=self.parse_param_group()
+        name=self.take().value
+        if self.peek("["):
+            # Generic type-parameter list: func F[T any](x T) ...
+            depth=0
+            while self.i < len(self.tokens):
+                v=self.take().value
+                if v == "[": depth += 1
+                elif v == "]":
+                    depth -= 1
+                    if depth == 0: break
+        params=self.parse_param_group()
+        results=[]
+        if self.peek("("): results=self.parse_param_group()
+        elif not self.peek("{") and not self.peek(";"): results=[self.parse_type()]
+        if self.peek(";"):
+            self.take(";")
+            return FuncDecl(line,name,receiver,params,results,None)
+        body=self.parse_block()
+        return FuncDecl(line,name,receiver,params,results,body)
+
+    def parse_param_group(self):
+        self.take("("); out=[]
+        type_starters={"*", "[", "func", "chan", "<-", "map", "struct", "interface"}
+        while not self.peek(")"):
+            line=self.t.line
+            names=[]
+
+            # Go parameter declarations have an important ambiguity:
+            #   func(rune, rune)        -- two unnamed parameter types
+            #   func(a, b int)          -- two named parameters
+            # Decide whether an identifier is a name by looking past a comma
+            # to see whether the following identifier is itself followed by a
+            # type token.
+            if self.t.kind in ("ident", "keyword"):
+                n0=self.tokens[self.i+1].value if self.i+1 < len(self.tokens) else None
+                named = (
+                    n0 in type_starters
+                    or (self.tokens[self.i+1].kind in ("ident", "keyword") if self.i+1 < len(self.tokens) else False)
+                )
+                if n0 == "...":
+                    named = True
+                elif n0 == "," and self.i+3 < len(self.tokens):
+                    # a, b int  -> named; rune, rune -> unnamed
+                    named = (
+                        self.tokens[self.i+2].kind in ("ident", "keyword")
+                        and self.tokens[self.i+3].value not in (",", ")", "...")
+                    )
+                if named:
+                    names.append(self.take().value)
+                    while self.maybe(","):
+                        if self.t.kind not in ("ident", "keyword"):
+                            break
+                        # The next identifier is another name only when what
+                        # follows it begins a type declaration.
+                        nxt=self.tokens[self.i+1].value if self.i+1 < len(self.tokens) else None
+                        if nxt == "..." or nxt in type_starters or (
+                            self.i+1 < len(self.tokens)
+                            and self.tokens[self.i+1].kind in ("ident", "keyword")
+                        ):
+                            names.append(self.take().value)
+                            continue
+                        break
+
+            variadic=self.maybe("...")
+            ty=self.parse_type()
+            out.append(Field(line,names,Expr(line,"variadic",True,[ty]) if variadic else ty))
+            if not self.maybe(",") and not self.peek(")"):
+                raise self.error("expected ',' in parameter list")
+        self.take(")"); return out
+
+    def parse_type(self):
+        line=self.t.line
+        if self.maybe("*"): return Expr(line,"pointer",None,[self.parse_type()])
+        if self.maybe("func"):
+            params=self.parse_param_group()
+            results=[]
+            if self.peek("("): results=self.parse_param_group()
+            elif not self.peek("{") and not self.peek(")") and not self.peek(";") and not self.peek("}") and not self.peek(",") and not self.peek("...") and self.t.kind not in ("eof",):
+                # A single unnamed result type, e.g. `func() bool`.
+                results=[self.parse_type()]
+            return Expr(line,"func_type",None,[params, results])
+        if self.maybe("["):
+            if self.maybe("..."): self.take("]"); return Expr(line,"array",None,[self.parse_type()])
+            n=None if self.peek("]") else self.parse_expr()
+            self.take("]"); return Expr(line,"array",n,[self.parse_type()])
+        if self.maybe("chan"):
+            direction="both"
+            if self.maybe("<-"): direction="recv"
+            ty=self.parse_type(); return Expr(line,"chan",direction,[ty])
+        if self.maybe("<-"):
+            self.take("chan"); return Expr(line,"chan","recv",[self.parse_type()])
+        if self.maybe("map"):
+            self.take("["); k=self.parse_type(); self.take("]"); v=self.parse_type(); return Expr(line,"map",None,[k,v])
+        if self.maybe("struct"):
+            self.take("{"); fields=[]
+            while not self.peek("}"):
+                fl=self.t.line; names=[]
+                # Only treat the leading identifier as a field name list when
+                # it is NOT a qualified embedded type (e.g. `sys.NotInHeap`).
+                # A dot after the first ident means it is a package-qualified
+                # embedded type, not a name.
+                if (self.t.kind in ("ident","keyword")
+                        and self.tokens[self.i+1].value not in (";","}", ".")
+                        and self.tokens[self.i+1].kind not in ("eof",)):
+                    names=self.parse_ident_list()
+                ty=self.parse_type(); tag=None
+                if self.t.kind=="string": tag=self.take().value
+                fields.append(Field(fl,names,ty,tag)); self.semi()
+            self.take("}"); return StructType(line,fields)
+        if self.maybe("interface"):
+            self.take("{"); methods=[]; embeds=[]
+            while not self.peek("}"):
+                ml=self.t.line
+                if self.t.kind in ("ident","keyword") and self.tokens[self.i+1].value=="(":
+                    n=self.take().value; params=self.parse_param_group(); results=[]
+                    if self.peek("("): results=self.parse_param_group()
+                    elif (self.t.kind in ("ident", "keyword") and self.i + 1 < len(self.tokens) and self.tokens[self.i + 1].value == "("):
+                        results=[]
+                    elif not self.peek(";") and not self.peek("}"): results=[self.parse_type()]
+                    methods.append(FuncDecl(ml,n,None,params,results,None))
+                else:
+                    # Type constraint: ~T, T | U, or embedded interface type.
+                    # Consume a union of types separated by `|`.
+                    self.maybe("~")  # tilde = underlying-type constraint; ignore for IR
+                    embed=self.parse_type()
+                    while self.maybe("|"):
+                        self.maybe("~")
+                        self.parse_type()  # consume but discard union alternatives
+                    embeds.append(embed)
+                self.semi()
+            self.take("}"); return InterfaceType(line,methods,embeds)
+        if self.t.kind in ("ident","keyword"):
+            name=self.take().value
+            while self.maybe("."):
+                name += "." + self.take().value
+            # Generic type arguments (T, Pointer[T], Map[K]V, ...).  The
+            # current IR does not need the static arguments, but it must
+            # consume them so real Go 1.18+ source remains parseable.
+            if self.peek("["):
+                generic_instantiated = True
+                depth=0
+                while self.i < len(self.tokens):
+                    v=self.take().value
+                    if v == "[": depth += 1
+                    elif v == "]":
+                        depth -= 1
+                        if depth == 0: break
+            return Expr(line,"type_name",name)
+        raise self.error("expected type")
+
+    def parse_block(self):
+        line=self.take("{").line; stmts=[]
+        while not self.peek("}"):
+            if self.peek(kind="eof"): raise self.error("unterminated block")
+            stmts.append(self.parse_stmt()); self.semi()
+        self.take("}"); return Block(line,stmts)
+
+    def parse_stmt(self):
+        t=self.t
+        if self.peek("{"): return self.parse_block()
+        if self.peek("if"): return self.parse_if()
+        if self.peek("for"): return self.parse_for()
+        if self.peek("switch"): return self.parse_switch()
+        if self.peek("select"): return self.parse_select()
+        if self.peek("return"):
+            self.take(); vals=[] if self.peek(";") or self.peek("}") else self.parse_expr_list(); return ReturnStmt(t.line,vals)
+        if self.peek("var"):
+            self.take()
+            if self.maybe("("):
+                specs=[]
+                while not self.peek(")"):
+                    specs.append(self.parse_var_spec(t.line)); self.semi()
+                self.take(")"); return specs
+            return self.parse_var_spec(t.line)
+        if self.peek("const"):
+            self.take()
+            if self.maybe("("):
+                specs=[]
+                while not self.peek(")"):
+                    specs.append(self.parse_const_spec(t.line)); self.semi()
+                self.take(")"); return specs
+            return self.parse_const_spec(t.line)
+        if self.peek("defer"): self.take(); return DeferStmt(t.line,self.parse_call_expr())
+        if self.peek("go"): self.take(); return GoStmt(t.line,self.parse_call_expr())
+        if self.peek("type"):
+            # Local type declaration inside a function body.
+            return self.parse_type_decl()
+        if self.peek("break") or self.peek("continue") or self.peek("goto") or self.peek("fallthrough"):
+            kw=self.take().value; label=None
+            if self.t.kind == "ident" and not self.peek(";") and not self.peek("}"): label=self.take().value
+            return BranchStmt(t.line,kw,label)
+        # label: statement
+        if self.t.kind=="ident" and self.tokens[self.i+1].value==":":
+            label=self.take().value; self.take(":"); return LabelStmt(t.line,label,self.parse_stmt())
+        return self.parse_simple_stmt()
+
+    def parse_if(self):
+        line=self.take("if").line; init=None
+        # In `if v { ... }`, the `{` belongs to the statement block, not
+        # to a composite literal `v{...}`.  Suppress composite-literal
+        # detection while parsing the if condition.
+        if self.t.kind in ("ident", "keyword") and self.tokens[self.i+1].value == "{":
+            first=Expr(self.t.line,"name",self.take().value)
+        else:
+            prev_nc = getattr(self, "_no_composite_lit", False)
+            self._no_composite_lit = True
+            try:
+                first=self.parse_simple_stmt_or_expr()
+            finally:
+                self._no_composite_lit = prev_nc
+        if self.maybe(";"):
+            init = first if isinstance(first, SimpleStmt) else None
+            if self.t.kind in ("ident", "keyword") and self.tokens[self.i+1].value == "{":
+                cond=Expr(self.t.line,"name",self.take().value)
+            else:
+                prev_nc = getattr(self, "_no_composite_lit", False)
+                self._no_composite_lit = True
+                try:
+                    cond=self.parse_expr()
+                finally:
+                    self._no_composite_lit = prev_nc
+        else: cond=first
+        then=self.parse_block(); other=None
+        self.maybe(";")
+        if self.maybe("else"):
+            other=self.parse_if() if self.peek("if") else self.parse_block()
+        return IfStmt(line,init,cond,then,other)
+
+    def parse_for(self):
+        line=self.take("for").line
+        if self.peek("{"): return ForStmt(line,body=self.parse_block())
+        # `for range expr { ... }` — range with no loop variables (Go 1.22+).
+        if self.peek("range"):
+            self.take("range")
+            prev_nc = getattr(self, "_no_composite_lit", False)
+            self._no_composite_lit = True
+            try:
+                expr=self.parse_expr()
+            finally:
+                self._no_composite_lit = prev_nc
+            return ForStmt(line, body=self.parse_block(), range_expr=expr, range_names=[])
+        # Recognize `for k, v := range expr` / `for k := range expr`
+        # before attempting the general three-part form.
+        save=self.i
+        if self.t.kind in ("ident", "keyword"):
+            # Look for a complete range assignment prefix without consuming it.
+            # The previous scanner stopped after the second identifier in
+            # `for k, v := range xs`, so the range form fell through into the
+            # ordinary expression parser.
+            j=self.i
+            if j < len(self.tokens) and self.tokens[j].kind in ("ident", "keyword"):
+                j += 1
+                while j < len(self.tokens) and self.tokens[j].value == ",":
+                    j += 1
+                    if j >= len(self.tokens) or self.tokens[j].kind not in ("ident", "keyword"):
+                        break
+                    j += 1
+            if j < len(self.tokens) and self.tokens[j].value in (":=", "=") and j + 1 < len(self.tokens) and self.tokens[j+1].value == "range":
+                lhs=[]
+                while self.t.value != ":=" and self.t.value != "=":
+                    lhs.append(self.take().value)
+                    if not self.maybe(","): break
+                self.take()
+                self.take("range")
+                if self.t.kind in ("ident", "keyword") and self.tokens[self.i+1].value == "{":
+                    expr=Expr(self.t.line, "name", self.take().value)
+                else:
+                    prev_nc = getattr(self, "_no_composite_lit", False)
+                    self._no_composite_lit = True
+                    try:
+                        expr=self.parse_expr()
+                    finally:
+                        self._no_composite_lit = prev_nc
+                return ForStmt(line,body=self.parse_block(),range_expr=expr,range_names=lhs)
+        self.i=save
+        init=None; cond=None; post=None
+        prev_nc = getattr(self, "_no_composite_lit", False)
+        self._no_composite_lit = True
+        try:
+            if self.maybe(";"):
+                # Empty init clause: for ; cond; post { ... }
+                cond=None if self.peek(";") else self.parse_expr()
+                self.take(";")
+                if not self.peek("{"): post=self.parse_simple_stmt()
+                self._no_composite_lit = prev_nc
+                return ForStmt(line,init,cond,post,self.parse_block())
+            first=self.parse_simple_stmt_or_expr()
+            if self.maybe(";"):
+                init=first
+                if not self.peek(";"): cond=self.parse_expr()
+                self.take(";")
+                if not self.peek("{"): post=self.parse_simple_stmt()
+            else: cond=first
+        finally:
+            self._no_composite_lit = prev_nc
+        return ForStmt(line,init,cond,post,self.parse_block())
+
+    def parse_switch(self):
+        line=self.take("switch").line; init=None; tag=None
+        if not self.peek("{"):
+            # A bare identifier immediately followed by the switch body is
+            # the switch tag (e.g. `switch x {`), not a composite literal.
+            if self.t.kind in ("ident", "keyword") and self.tokens[self.i+1].value == "{":
+                first=Expr(self.t.line, "name", self.take().value)
+            else:
+                prev_nc = getattr(self, "_no_composite_lit", False)
+                self._no_composite_lit = True
+                try:
+                    first=self.parse_simple_stmt_or_expr()
+                finally:
+                    self._no_composite_lit = prev_nc
+            if self.maybe(";"):
+                init=first
+                if not self.peek("{"):
+                    prev_nc = getattr(self, "_no_composite_lit", False)
+                    self._no_composite_lit = True
+                    try:
+                        tag=self.parse_expr()
+                    finally:
+                        self._no_composite_lit = prev_nc
+            else: tag=first
+        self.take("{"); clauses=[]
+        while not self.peek("}"):
+            cl=self.t.line
+            if self.maybe("case"):
+                # Type-switch cases may contain interface literals such as
+                # `case interface{ Unwrap() error }:`.  That is a type, not
+                # an ordinary expression/composite literal.
+                if self.peek("interface"):
+                    ex=[self.parse_type()]
+                    while self.maybe(","):
+                        ex.append(self.parse_type() if self.peek("interface") else self.parse_expr())
+                else:
+                    ex=self.parse_expr_list()
+                self.take(":"); default=False
+            elif self.maybe("default"): ex=[]; self.take(":"); default=True
+            else: raise self.error("expected case/default")
+            stmts=[]
+            while not self.peek("case") and not self.peek("default") and not self.peek("}"):
+                stmts.append(self.parse_stmt()); self.semi()
+            clauses.append(CaseClause(cl,ex,stmts,default))
+        self.take("}"); return SwitchStmt(line,init,tag,clauses)
+
+    def parse_select(self):
+        line=self.take("select").line; self.take("{"); clauses=[]
+        while not self.peek("}"):
+            cl=self.t.line; default=False
+            if self.maybe("case"): comm=self.parse_simple_stmt(); self.take(":")
+            elif self.maybe("default"): comm=None; default=True; self.take(":")
+            else: raise self.error("expected select case/default")
+            stmts=[]
+            while not self.peek("case") and not self.peek("default") and not self.peek("}"):
+                stmts.append(self.parse_stmt()); self.semi()
+            clauses.append(CommClause(cl,comm,stmts,default))
+        self.take("}"); return SelectStmt(line,clauses)
+
+    def parse_simple_stmt_or_expr(self):
+        # Communication statements and assignments have expression lists on
+        # their left-hand side (e.g. `v, ok := <-ch`).  Parse the first
+        # expression and extend it only when a comma is actually present.
+        left=[self.parse_expr()]
+        if self.peek(","):
+            self.take(",")
+            left.extend(self.parse_expr_list())
+        if self.t.value in (":=", "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "&^=", "<<=", ">>=", "++", "--", "<-"):
+            op=self.take().value
+            if op in ("++","--"): return SimpleStmt(left[0].line,op,left,[])
+            return SimpleStmt(left[0].line,op,left,self.parse_expr_list())
+        if len(left) > 1:
+            raise self.error("expected assignment or communication operator after expression list")
+        return left[0]
+
+    def parse_simple_stmt(self): return self.parse_simple_stmt_or_expr()
+
+    def parse_expr_list(self):
+        out=[self.parse_expr()]
+        while self.maybe(","): out.append(self.parse_expr())
+        return out
+
+    PRECEDENCE={"||":1,"&&":2,"==":3,"!=":3,"<":4,"<=":4,">":4,">=":4,"|":5,"^":6,"&":7,"<<":10,">>":10,"&^":10,"+":9,"-":9,"*":11,"/":11,"%":11}
+    def parse_expr(self, min_prec=0):
+        left=self.parse_unary()
+        while self.t.value in self.PRECEDENCE and self.PRECEDENCE[self.t.value] >= min_prec:
+            op=self.take().value; prec=self.PRECEDENCE[op]; right=self.parse_expr(prec+1)
+            left=Expr(left.line,"binary",op,[left,right])
+        return left
+
+    def parse_unary(self):
+        t=self.t
+        if t.value in ("+","-","!","^","*","&","<-", "~"):
+            op=self.take().value
+            # Unary `&` may prefix a composite literal: `&T{...}`.
+            # Set a flag so _can_start_composite_literal allows `{` after
+            # the operand.  `*` is a pointer dereference in expressions and
+            # must NOT enable composite-literal parsing (e.g. `if *p { ... }`
+            # would incorrectly consume the if-body as `p{...}`).
+            if op == "&":
+                prev = getattr(self, "_allow_composite", False)
+                self._allow_composite = True
+                try:
+                    result = self.parse_unary()
+                finally:
+                    self._allow_composite = prev
+                return Expr(t.line, "unary", op, [result])
+            return Expr(t.line,"unary",op,[self.parse_unary()])
+        return self.parse_primary()
+
+    def _qualified_composite_ahead(self):
+        # Qualified literals such as sync.Pool{New: ...}.  Avoid confusing
+        # exported constants in control-flow expressions (e.g. RuneSelf { ... })
+        # with literals by requiring an unmistakable keyed/empty literal.
+        if not self.peek("{"):
+            return False
+        if self.i + 1 >= len(self.tokens):
+            return False
+        nxt=self.tokens[self.i + 1]
+        if nxt.value == "}":
+            return True
+        if nxt.kind in ("number", "string", "rune"):
+            return True
+        if nxt.kind in ("ident", "keyword") and self.i + 2 < len(self.tokens):
+            return self.tokens[self.i + 2].value == ":"
+        return nxt.value in ("&", "{", "[")
+
+    def _can_start_composite_literal(self):
+        # An identifier followed by `{` is only a composite literal when it
+        # occurs in a primary-expression position.  In particular, do not
+        # consume the body of `if x == y { ... }` as `y{...}`, and do not
+        # treat `a & b {` or `a * b {` (binary op before a switch/for/if
+        # body) as a composite literal.  Unary `&` is handled via the
+        # _allow_composite flag set in parse_unary.
+        # _no_composite_lit suppresses ALL composite literals (set in
+        # parse_if / parse_for / parse_switch for their condition expressions).
+        if getattr(self, "_no_composite_lit", False):
+            return False
+        if getattr(self, "_allow_composite", False):
+            return True
+        if self.i <= 1:
+            return True
+        prev = self.tokens[self.i - 2].value
+        return prev in ("(", "[", "{", ",", "=", ":=", "return", ":")
+
+    def parse_primary(self):
+        t=self.t
+        if t.value=="{":
+            line=self.take("{").line; elems=[]
+            while not self.peek("}"):
+                first=self.parse_expr()
+                if self.maybe(":"):
+                    second=self.parse_expr(); first=Expr(first.line,"keyed",None,[first,second])
+                elems.append(first)
+                if self.maybe(","):
+                    continue
+                if self.maybe(";"):
+                    continue
+                if not self.peek("}") and self.t.kind in ("ident", "keyword", "number", "string", "rune"):
+                    continue
+                break
+            self.take("}")
+            return self.parse_postfix(Expr(line,"composite",None,elems))
+        if t.value=="(":
+            # Parenthesized type expressions occur in real stdlib source as
+            # conversions, e.g. (*interface{ ... })(nil).  The old path
+            # always parsed the contents as an expression, so `interface`
+            # was consumed as a name and the following `{` produced
+            # "expected ')', got '{'".  Try a type first when the token can
+            # start a type, then fall back to an ordinary parenthesized expr.
+            # Also clear _no_composite_lit inside parens: `{` inside `(` is
+            # always a composite-literal or func-literal, never a block body.
+            save=self.i
+            type_starters={"*", "[", "func", "chan", "<-", "map", "struct", "interface"}
+            if self.i + 1 < len(self.tokens) and self.tokens[self.i + 1].value in type_starters:
+                try:
+                    self.take("(")
+                    ty=self.parse_type()
+                    if self.peek(")"):
+                        self.take(")")
+                        return self.parse_postfix(ty)
+                except GoSyntaxError:
+                    pass
+                self.i=save
+            prev_nc = getattr(self, "_no_composite_lit", False)
+            self._no_composite_lit = False
+            try:
+                self.take(); x=self.parse_expr(); self.take(")")
+            finally:
+                self._no_composite_lit = prev_nc
+            return self.parse_postfix(x)
+        if t.kind in ("number","string","rune"):
+            self.take(); return self.parse_postfix(Expr(t.line,"literal",t.value))
+        # Type keywords that can start a composite literal in expression
+        # position: map[K]V{...}, chan T, struct{...}{...}, interface{...}(x).
+        # Parse them as types, then check for `{` to form a composite literal.
+        if t.value in ("map", "chan", "struct", "interface"):
+            save=self.i
+            try:
+                ty=self.parse_type()
+                if self.peek("{"):
+                    prev_nc3 = getattr(self, "_no_composite_lit", False)
+                    self._no_composite_lit = False
+                    self.take(); elems=[]
+                    try:
+                        while not self.peek("}"):
+                            first=self.parse_expr()
+                            if self.maybe(":"):
+                                second=self.parse_expr()
+                                elems.append(Expr(first.line,"keyed",None,[first,second]))
+                            else:
+                                elems.append(first)
+                            if self.maybe(","):
+                                continue
+                            if self.maybe(";"):
+                                continue
+                            if not self.peek("}") and self.t.kind in ("ident","keyword","number","string","rune"):
+                                continue
+                            break
+                        self.take("}")
+                    finally:
+                        self._no_composite_lit = prev_nc3
+                    return self.parse_postfix(Expr(t.line,"composite",ty,elems))
+                return self.parse_postfix(ty)
+            except GoSyntaxError:
+                self.i=save
+        if t.value == "func":
+            line=self.take("func").line
+            params=self.parse_param_group()
+            results=[]
+            if self.peek("("): results=self.parse_param_group()
+            elif not self.peek("{"): results=[self.parse_type()]
+            body=self.parse_block()
+            return self.parse_postfix(Expr(line,"func_lit",None,[params,results,body]))
+        if t.kind in ("ident","keyword"):
+            self.take(); x=Expr(t.line,"name",t.value)
+            generic_instantiated = False
+            # Generic instantiation such as Pointer[int].  Static type
+            # arguments are intentionally erased in this IR, but consuming
+            # the balanced bracket list is necessary before seeing T{...}.
+            if self.peek("["):
+                # In expression position `x[...]` is normally indexing/slicing.
+                # Treat it as generic instantiation only when the matching `]`
+                # is immediately followed by syntax that can continue a type
+                # instantiation (call, composite literal, or selector).
+                depth=0; j=self.i
+                while j < len(self.tokens):
+                    v=self.tokens[j].value
+                    if v == "[": depth += 1
+                    elif v == "]":
+                        depth -= 1
+                        if depth == 0: break
+                    j += 1
+                after = self.tokens[j + 1].value if j + 1 < len(self.tokens) else ""
+                if depth == 0 and after in ("(", "{", "."):
+                    # In expression position `x[i]` is an index expression,
+                    # even when the enclosing statement is followed by `{`
+                    # (for example `switch x[i] {` or `for ... range x[i] {`).
+                    # Treat bracketed expressions as generic instantiation only
+                    # when the base looks like a type (exported identifier) or
+                    # when the continuation is a call.  Do NOT treat `x[i].f`
+                    # (lowercase x, selector after bracket) as generic
+                    # instantiation — that is a plain index + selector.
+                    bracket_text = [tok.value for tok in self.tokens[self.i:j+1]]
+                    looks_type = bool(t.value[:1].isupper()) and ":" not in bracket_text
+                    if after == "(" or (after == "{" and looks_type) or (after == "." and looks_type):
+                        generic_instantiated = True
+                        while self.i <= j:
+                            self.take()
+            qualified_type=False
+            had_selector = False
+            while self.peek(".") and self.tokens[self.i+1].kind in ("ident", "keyword"):
+                self.take(".")
+                member=self.take().value
+                qualified_type = member[:1].isupper()
+                had_selector = True
+                x=Expr(x.line,"selector",member,[x])
+            qualified_ok = (not getattr(self, "_no_composite_lit", False)) and qualified_type and self._qualified_composite_ahead()
+            allow = self._can_start_composite_literal()
+            if self.peek("{") and t.value not in KEYWORDS and (allow or qualified_ok or generic_instantiated):
+                # Composite literal: T{...}.  Preserve keyed elements as
+                # explicit key/value nodes so real stdlib source such as
+                # `T{field: value}` remains representable.
+                self.take(); elems=[]
+                while not self.peek("}"):
+                    first=self.parse_expr()
+                    if self.maybe(":"):
+                        second=self.parse_expr()
+                        elems.append(Expr(first.line,"keyed",None,[first,second]))
+                    else:
+                        elems.append(first)
+                    if self.maybe(","):
+                        continue
+                    # A semicolon can be inserted by the lexer after a
+                    # multiline composite element.  Accept it as an element
+                    # separator; this mirrors Go's scanner/parser boundary
+                    # and prevents the following identifier from being
+                    # reported as an unexpected token.
+                    if self.maybe(";"):
+                        continue
+                    if not self.peek("}"):
+                        # Be permissive for source variants that contain
+                        # newline-separated positional elements without an
+                        # explicit comma.
+                        if self.t.kind in ("ident", "keyword", "number", "string", "rune"):
+                            continue
+                    break
+                self.take("}"); x=Expr(t.line,"composite",x,[*elems])
+            return self.parse_postfix(x)
+        if t.value=="[":
+            # Slice/array type used as a composite literal, e.g. []byte{...}.
+            ty=self.parse_type()
+            if not self.peek("{"):
+                # Array/slice type as an ordinary expression operand, e.g.
+                # the first argument of make([]byte, 0).
+                return self.parse_postfix(ty)
+            self.take(); elems=[]
+            while not self.peek("}"):
+                first=self.parse_expr()
+                if self.maybe(":"):
+                    second=self.parse_expr(); elems.append(Expr(first.line,"keyed",None,[first,second]))
+                else:
+                    elems.append(first)
+                if not self.maybe(","): break
+            self.take("}")
+            return self.parse_postfix(Expr(t.line,"composite",ty,elems))
+        raise self.error("expected expression")
+
+    def parse_postfix(self,x):
+        _TYPE_STARTERS = {"map", "chan", "struct", "interface", "func"}
+        while True:
+            if self.maybe("("):
+                # Inside call parens, `{` is always a composite/func literal,
+                # never a block body — clear the no-composite-literal flag.
+                prev_nc = getattr(self, "_no_composite_lit", False)
+                self._no_composite_lit = False
+                args=[]
+                try:
+                  while not self.peek(")"):
+                    # When a call argument starts with a type-starter keyword,
+                    # attempt to parse it as a type (e.g. make(map[int]int, 0)
+                    # or new(struct{x int})).  If a `{` follows the type, parse
+                    # a composite literal (e.g. unsafe.Offsetof(struct{v int}{}.v)).
+                    # Fall back to parse_expr on failure.
+                    if self.t.value in _TYPE_STARTERS:
+                        save=self.i
+                        try:
+                            ty_arg=self.parse_type()
+                            if self.peek("{"):
+                                if self.tokens[save].value == "func":
+                                    # func(...){} is a function literal, not a
+                                    # composite literal.  Fall back to parse_expr.
+                                    self.i = save
+                                    arg = self.parse_expr()
+                                else:
+                                    # Composite literal: type{...}
+                                    self.take(); elems=[]
+                                    while not self.peek("}"):
+                                        first=self.parse_expr()
+                                        if self.maybe(":"):
+                                            second=self.parse_expr()
+                                            elems.append(Expr(first.line,"keyed",None,[first,second]))
+                                        else:
+                                            elems.append(first)
+                                        if not self.maybe(","): break
+                                    self.take("}")
+                                    arg=self.parse_postfix(Expr(ty_arg.line,"composite",ty_arg,elems))
+                            else:
+                                arg=ty_arg
+                        except GoSyntaxError:
+                            self.i=save
+                            arg=self.parse_expr()
+                    else:
+                        arg=self.parse_expr()
+                    if self.maybe("..."):
+                        arg=Expr(arg.line,"variadic",None,[arg])
+                    args.append(arg)
+                    if not self.maybe(","): break
+                finally:
+                    self._no_composite_lit = prev_nc
+                self.take(")"); x=Expr(x.line,"call",None,[x,*args]); continue
+            if self.maybe("["):
+                # Inside `[...]`, `{` is always a composite/func literal.
+                prev_nc2 = getattr(self, "_no_composite_lit", False)
+                self._no_composite_lit = False
+                try:
+                    # Index, slice, and full-slice expressions.
+                    if self.maybe(":"):
+                        lo=None
+                        hi=None if self.peek("]") else self.parse_expr()
+                        maxv=None
+                        if self.maybe(":"):
+                            maxv=None if self.peek("]") else self.parse_expr()
+                        self.take("]")
+                        x=Expr(x.line,"slice",None,[x,lo,hi,maxv]); continue
+                    first=self.parse_expr()
+                    if self.maybe(":"):
+                        hi=None if self.peek("]") else self.parse_expr()
+                        maxv=None
+                        if self.maybe(":"):
+                            maxv=None if self.peek("]") else self.parse_expr()
+                        self.take("]")
+                        x=Expr(x.line,"slice",None,[x,first,hi,maxv]); continue
+                    self.take("]"); x=Expr(x.line,"index",None,[x,first]); continue
+                finally:
+                    self._no_composite_lit = prev_nc2
+            if self.maybe("."):
+                if self.maybe("("):
+                    # Type assertion: x.(T) or x.(type) in a type switch.
+                    ty="type" if self.maybe("type") else self.parse_type()
+                    self.take(")")
+                    x=Expr(x.line,"type_assert",ty,[x]); continue
+                name=self.take().value; x=Expr(x.line,"selector",name,[x]); continue
+            break
+        return x
+
+    def parse_call_expr(self):
+        x=self.parse_primary()
+        if x.kind != "call": raise self.error("expected function call")
+        return x
+
+
+def parse_go(source: str) -> File:
+    return Parser(source).parse()
+
+
+def walk(node):
+    """Yield AST nodes depth-first; useful for later lowering/analysis."""
+    if isinstance(node, Node):
+        yield node
+        for value in vars(node).values():
+            yield from walk(value)
+    elif isinstance(node, (list, tuple)):
+        for x in node: yield from walk(x)
+    elif isinstance(node, dict):
+        for x in node.values(): yield from walk(x)
