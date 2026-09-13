@@ -1,0 +1,16 @@
+test complete
+
+results are as follows:
+
+```
+[1/4] support-library smoke test
+PASS
+[2/4] original t.py translation/exec test
+library-test
+PASS
+[3/4] Moby cmd/dockerd/main.go translate + compile + exec
+PASS: main.go emitted and compiled (5202 bytes)
+
+[4/4] recursive Moby daemon translation graph
+PASS: Moby daemon translation graph compiled
+```
