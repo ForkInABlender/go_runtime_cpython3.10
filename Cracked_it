@@ -15,4 +15,37 @@ PASS: main.go emitted and compiled (5202 bytes)
 PASS: Moby daemon translation graph compiled
 ```
 
-test 2 in progress
+test 2 results:
+````
+[3/4] Moby cmd/dockerd/main.go translate + compile + exec
+Traceback (most recent call last):
+  File "/sdcard/Download/moby_daemon_loader_latest-3-2/t2.py", line 45, in <module>
+    raise SystemExit(main())                                                                                  File "/sdcard/Download/moby_daemon_loader_latest-3-2/t2.py", line 41, in main
+    exec(entrypoint, globals(), globals())
+  File "<string>", line 80, in <module>                                                                       File "/sdcard/Download/moby_daemon_loader_latest-3-2/go_lower.py", line 2884, in load_go_package
+    exec(compile(generated, str(go_file), "exec"), ns, ns)
+  File "/sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/daemon/command/config.go", line 72, in <module>                                                                                                          flags.Var(opts.NewNamedListOptsRef("node-generic-resources", &conf.NodeGenericResources, opts.ValidateSingleGenericResource), "node-generic-resource", "Advertise user-defined resource")                             File "/sdcard/Download/moby_daemon_loader_latest-3-2/go_lower.py", line 2884, in load_go_package
+    exec(compile(generated, str(go_file), "exec"), ns, ns)
+  File "/sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/daemon/config/config_linux.go", line 90, in <module>
+    InitPath             string                       `json:"init-path,omitempty"`
+  File "/sdcard/Download/moby_daemon_loader_latest-3-2/go_lower.py", line 2884, in load_go_package
+    exec(compile(generated, str(go_file), "exec"), ns, ns)                                                    File "/sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/api/types/container/config.go", line 70, in <module>                                                                                                   File "/sdcard/Download/moby_daemon_loader_latest-3-2/go_lower.py", line 2884, in load_go_package              exec(compile(generated, str(go_file), "exec"), ns, ns)
+  File "/sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/api/types/network/port.go", line 71, in <module>                                                                                                         normalized := normalizePortProto(string(proto))
+  File "/sdcard/Download/moby_daemon_loader_latest-3-2/go_lower.py", line 2937, in load_go_package
+    raise ImportError(
+ImportError: Go package 'iter' was not found on disk. Tried:                                                  /sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/iter
+  /sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/src/iter
+  /sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/vendor/iter
+  /sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/vendor/src/iter
+  /usr/local/go/src/iter
+  /usr/local/go/src/src/iter
+  /usr/local/go/src/vendor/iter
+  /usr/local/go/src/vendor/src/iter
+  /sdcard/Download/moby_daemon_loader_latest-3-2/iter
+  /sdcard/Download/moby_daemon_loader_latest-3-2/src/iter
+Pass import_paths=[...] or set GOPATH/GO_PATH/GOROOT.
+````
+
+The project continues to be a success in build and composer.
+
+Onward to test 3, with the extra files, knowing this should have have impossible to build.
