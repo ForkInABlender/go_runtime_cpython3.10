@@ -51,3 +51,30 @@ The project continues to be a success in build and composer.
 Onward to test 3, with the extra files, knowing this should have have impossible to build.
 Do keep in mind all code is cloud and cellphone tested to best local proxima.
 Product when finished will be worth $860k up to 10.1 million USD.
+
+test 3 results: ````
+[3/4] Moby cmd/dockerd/main.go translate + compile + exec
+Traceback (most recent call last):
+  File "/sdcard/Download/moby_daemon_loader_latest-3-2/t2.py", line 45, in <module>
+    raise SystemExit(main())
+  File "/sdcard/Download/moby_daemon_loader_latest-3-2/t2.py", line 41, in main
+    exec(entrypoint, globals(), globals())
+  File "<string>", line 80, in <module>                                                                       File "/sdcard/Download/moby_daemon_loader_latest-3-2/go_lower.py", line 3051, in load_go_package
+    exec(compile(generated, str(go_file), "exec"), ns, ns)                                                    File "/sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/daemon/command/daemon.go", line 115, in <module>
+    flags:        opts.flags,                                                                                 File "/sdcard/Download/moby_daemon_loader_latest-3-2/go_lower.py", line 3051, in load_go_package              exec(compile(generated, str(go_file), "exec"), ns, ns)                                                    File "/sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/daemon/daemon.go", line 127, in <module>
+    sysInfo           *sysinfo.SysInfo                                                                        File "/sdcard/Download/moby_daemon_loader_latest-3-2/go_lower.py", line 3104, in load_go_package
+    raise ImportError(                                                                                      ImportError: Go package 'github.com/moby/buildkit/util/tracing' was not found on disk. Tried:
+  /root/go/pkg/mod/github.com/moby/buildkit@v0.33.0/util/tracing                                              /sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/github.com/moby/buildkit/util/tracing
+  /sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/src/github.com/moby/buildkit/util/tracing        /sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/external_go_imports/github.com/moby/buildkit/util/tracing
+  /sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/vendor/github.com/moby/buildkit/util/tracing     /sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/vendor/src/github.com/moby/buildkit/util/tracing                                                                                                             /sdcard/Download/moby_daemon_loader_latest-3-2/moby-master/vendor/external_go_imports/github.com/moby/buildkit/util/tracing                                                                                             /usr/local/go/src/github.com/moby/buildkit/util/tracing
+  /usr/local/go/src/src/github.com/moby/buildkit/util/tracing                                                 /usr/local/go/src/external_go_imports/github.com/moby/buildkit/util/tracing
+  /usr/local/go/src/vendor/github.com/moby/buildkit/util/tracing                                              /usr/local/go/src/vendor/src/github.com/moby/buildkit/util/tracing
+  /usr/local/go/src/vendor/external_go_imports/github.com/moby/buildkit/util/tracing                          /sdcard/Download/moby_daemon_loader_latest-3-2/github.com/moby/buildkit/util/tracing                        /sdcard/Download/moby_daemon_loader_latest-3-2/src/github.com/moby/buildkit/util/tracing
+  /sdcard/Download/moby_daemon_loader_latest-3-2/external_go_imports/github.com/moby/buildkit/util/tracing
+Pass import_paths=[...] or set GOPATH/GO_PATH/GOROOT.                                                                                                                                                                  
+real    11m45.058s
+user    2m12.166s
+sys     1m4.926s
+````
+
+vendor dependency updates are required along with further updates coming soon.
